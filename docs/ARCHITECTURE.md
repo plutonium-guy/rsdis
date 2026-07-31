@@ -540,8 +540,68 @@ zero-copy needs a vectored write queue of `Bytes` in `src/net` — **W1b owns th
 decision.** Until W1b does it, nobody may claim §5.1 is satisfied for large
 values.
 
+**9.12 Criterion cannot be used until a `[[bench]] harness = false` target
+exists.** `Cargo.toml` is F0's and agents cannot edit it, so a criterion bench
+in `benches/` is auto-discovered with the default test harness and its `main`
+never runs. Until this is fixed, write benchmarks as `#[ignore]`d self-timing
+tests and run them with
+`cargo test --release --bench <name> -- --ignored --nocapture`. **Report the
+filename in your handover** so the bench target can be registered at merge.
+W1b's `benches/protocol_bench.rs` is the reference for the interim style.
+
 **9.11 Config quirks.** `port 0` is legal (means ephemeral) and `Config::validate`
 runs on every `CONFIG SET`, not just at startup. `Cli` is not a plain clap derive:
 `rsdis --port 6399` has no positional before the first flag, which clap rejects,
 so `Cli::from_env` splits argv the way `redis-server` does and defers to clap only
 for `--help` / `--version`.
+
+---
+
+## 10. Known gaps, deferred to W4
+
+Measured, owned, and deliberately not fixed yet. Listed here so nobody claims
+they are done and nobody re-discovers them.
+
+**10.1 `bulk_from` does not use the vectored write queue — §5.1 is NOT met for
+large values.** W1b built the queue and measured the wiring it cannot do:
+
+| value | memcpy + write | queue + writev | delta |
+|---|---|---|---|
+| 8 B | 3.10 µs | 3.43 µs | −10% |
+| 512 B | 3.43 µs | 3.62 µs | −3% |
+| 2 KiB | 5.95 µs | 5.42 µs | +9% |
+| 4 KiB | 10.4 µs | 7.7 µs | +26% |
+| 64 KiB | 120 µs | 97 µs | +20% |
+
+Corroborated end to end: 64 KB `GET` is 53.5k/s against real Redis 8.6's 61.7k/s
+on the same host, while 8 B and 512 B are at parity. That gap is exactly this
+memcpy.
+
+The blocker is structural, not a matter of effort: `ReplyWriter` is
+`{ buf: &'a mut BytesMut }` and holds no handle to `net`, and it cannot be made
+generic over a sink because `Handler` is a plain `fn` pointer — generics cannot
+cross a function-pointer command table. The fix is to move the staging/queue
+split *into* `reply.rs` (a `FrameQueue` that `net::OutputBuffer` consumes rather
+than defines) so the dispatch stays static. That restructures the two hottest
+types in the server at once, which is a W4 job with every agent finished — not
+something to attempt while waves are in flight.
+
+The threshold is already chosen and shipped as `OutputBuffer::should_queue`
+(~2 KiB); only the `bulk_from` call site is missing.
+
+**10.2 `ClientHandle` has no wave-owned slot,** so `CLIENT LIST` cannot report
+`db`/`resp`/`flags`/`qbuf`/`obl` for *other* connections. W1b worked around it
+with a process-wide table in `src/net/registry.rs`. The right fix is the §9.2
+treatment: one slot on `ClientHandle` whose type `net` owns. Retire the registry
+when that lands.
+
+**10.3 `client-output-buffer-limit` is enforced with Redis's defaults but has no
+config knob.** Enforcement is real; only tuning is missing. **W3c owns
+`CONFIG GET`/`SET` and should wire this** rather than F0 adding a field nobody
+reads.
+
+**10.4 Container commands re-invent subcommand reporting.** Per §9.9 there is no
+subcommand support in `CommandSpec`, so W1b set `client.last_command` by hand to
+get `cmd=client|list` and `'client|setname'` arity errors. Every container
+command (`CONFIG`, `XGROUP`, `OBJECT`, `MEMORY`) will repeat this. Worth a shared
+helper in W4, or real subcommand specs if `COMMAND DOCS` fidelity matters.
