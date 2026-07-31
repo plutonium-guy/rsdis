@@ -25,3 +25,7 @@ temp-*.rdb
 *.swp
 perf.data*
 flamegraph.svg
+
+# Subagent worktrees. These are live git worktrees of this same repo;
+# committing them creates gitlinks that break clones.
+.claude/worktrees/
