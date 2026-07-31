@@ -1,0 +1,27 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Persistence artifacts produced by a running server
+*.rdb
+*.aof
+appendonlydir/
+dump.rdb
+temp-*.rdb
+
+# macOS AppleDouble sidecars. This repository frequently lives on an exFAT
+# volume, where macOS writes resource forks as ._<name> files next to every
+# real file. They are never source.
+._*
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# Editor / tooling
+.idea/
+.vscode/
+*.swp
+perf.data*
+flamegraph.svg
