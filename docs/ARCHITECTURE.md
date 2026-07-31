@@ -457,3 +457,91 @@ Definition of done for any wave agent: `cargo build --release` clean,
 `cargo clippy --all-targets -- -D warnings` clean, `cargo test` green, `cargo fmt`
 applied, and a summary of what was implemented, what was skipped, and the numbers
 for anything claimed to be fast.
+
+---
+
+## 9. Binding amendments from W0
+
+W0 found eleven places where §§1–8 were wrong or underspecified. These are now
+part of the contract and override anything above that contradicts them.
+
+**9.1 `Args` is a slice, not a struct.** §4.4 used `&Args` without defining it.
+
+```rust
+pub type Args    = [Bytes];                  // unsized; handlers take &Args
+pub type ArgVec  = SmallVec<[Bytes; 8]>;     // owned storage, derefs to Args
+pub type KeyPositions = SmallVec<[usize; 8]>;
+```
+
+`ArgsExt` provides `at` / `i64_at` / `f64_at` / `kw_at`. Use it; do not index.
+
+**9.2 Wave state hangs off `ClientState` / `ServerShared` through your own
+type.** Both live in the frozen `ctx.rs`, so you cannot add fields to them. Each
+wave gets exactly one slot, already declared, whose type your module owns:
+
+| slot | owner | type |
+|---|---|---|
+| `ClientState::subs` | W3b | `pubsub::ClientSubs` |
+| `ClientState::block` | W3b | `blocking::ClientBlockState` |
+| `ClientState::multi` | W3b | `transaction::MultiState` |
+| `ServerShared::{pubsub, blocking, slowlog, stats}` | W3b / W3c | their own types |
+
+Put everything your wave needs inside that type. This is the rule that keeps
+`ctx.rs` frozen.
+
+**9.3 Read commands must use the `*_read` accessors.** `lookup_write` and
+`get_<type>` bump the dirty counter, which invalidates `WATCH` and triggers
+verbatim propagation. A read-only command that reaches for `&mut` will abort
+concurrent transactions and write junk to the AOF. `LRANGE`, `ZSCORE`, `HGET`,
+`SMEMBERS`, `GETRANGE` and friends use `get_<type>_read` / `lookup_read`. This is
+not a style preference; it is a correctness requirement, and it is the easiest
+mistake in the entire project to make silently.
+
+Note also that the typed write accessors type-check *before* signalling dirty, so
+a `WRONGTYPE` does not dirty the key. Preserve that ordering.
+
+**9.4 Float formatting is `strnum::d2string`, and it is not negotiable.** `ryu`
+produces the right *digits* and the wrong *presentation*. Redis routes integral
+doubles through `double2ll`, whose window is `LLONG_MAX/2` (~4.6e18) and **not**
+2^52 — which is why `1e18` prints `1000000000000000000` but `1e19` prints
+`1e+19`. Everything else goes through `fpconv.c:emit_digits`, whose plain-vs-
+scientific thresholds no stock formatter reproduces. `-0.0` prints `-0`, not `0`.
+This is validated against a live Redis over 1033 doubles. **Do not "simplify" it,
+and do not call `format!("{}", x)` on a score.**
+
+The formatters take `&mut impl ByteSink`, so write into the reply buffer directly
+or into a stack `strnum::NumBuf`. Never into a fresh `Vec` (§5.12).
+
+**9.5 Propagation anchors on the lowest-indexed locked shard.** A cross-shard
+command must appear exactly once in the AOF stream, so it goes into one shard's
+`repl_buf` — the lowest-indexed one it holds. Propagation is gated on
+`ServerShared::propagation_enabled` and costs nothing until W3a enables AOF.
+
+**9.6 `EXEC` locks the union of its queued commands' keys, once, ascending.**
+`transaction::intercept` runs *before* any lock is taken, so queuing never
+touches a shard. Locking per queued command inside `EXEC` breaks the
+deadlock-freedom proof in §2.1. There is no escape hatch; do not add one.
+
+**9.7 `Entry` lives in `object.rs`** and is re-exported from `crate::shard`.
+§3 and §4.1 both claimed it.
+
+**9.8 `Robj` is capped at 40 bytes and `Entry` at 64,** enforced by a `const`
+assertion in `object.rs` plus a test that reports actual sizes on failure. 40 is
+the natural floor: `StrObj` is a `Bytes` (32) plus a discriminant (8). `ZSetObj`
+and `StreamObj` will not fit and must box their payloads. See §5.11.
+
+**9.9 `CommandSpec` has no subcommand support.** `CLIENT`, `CONFIG`, `XGROUP`,
+`OBJECT` etc. dispatch subcommands inside their own handler. Consequences to
+accept for v1: `COMMAND DOCS` is incomplete for containers, and an arity error
+says `'client'` rather than `'client|setname'`.
+
+**9.10 `ReplyWriter::bulk_from` is not yet zero-copy.** It memcpys today. Real
+zero-copy needs a vectored write queue of `Bytes` in `src/net` — **W1b owns this
+decision.** Until W1b does it, nobody may claim §5.1 is satisfied for large
+values.
+
+**9.11 Config quirks.** `port 0` is legal (means ephemeral) and `Config::validate`
+runs on every `CONFIG SET`, not just at startup. `Cli` is not a plain clap derive:
+`rsdis --port 6399` has no positional before the first flag, which clap rejects,
+so `Cli::from_env` splits argv the way `redis-server` does and defers to clap only
+for `--help` / `--version`.

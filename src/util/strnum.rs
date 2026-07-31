@@ -183,6 +183,59 @@ pub fn double2ll(v: f64) -> Option<i64> {
     if (l as f64) == v { Some(l) } else { None }
 }
 
+/// A byte destination for the number formatters.
+///
+/// The formatters below used to take `&mut Vec<u8>`, which forced the reply
+/// path to build a throwaway `Vec` for every `ZSCORE`, `ZINCRBY`, `GEODIST`
+/// and RESP3 double -- an allocation per reply, in violation of §5.7 and
+/// §5.12. With this trait the same code writes directly into the connection's
+/// `BytesMut`, or into a stack `SmallVec` when a length prefix has to be
+/// computed before the digits are emitted.
+///
+/// Only `push` and `extend_from_slice` are needed, so the trait stays at two
+/// methods and every call inlines away.
+pub trait ByteSink {
+    fn push(&mut self, b: u8);
+    fn extend_from_slice(&mut self, s: &[u8]);
+}
+
+impl ByteSink for Vec<u8> {
+    #[inline]
+    fn push(&mut self, b: u8) {
+        Vec::push(self, b);
+    }
+    #[inline]
+    fn extend_from_slice(&mut self, s: &[u8]) {
+        Vec::extend_from_slice(self, s);
+    }
+}
+
+impl ByteSink for bytes::BytesMut {
+    #[inline]
+    fn push(&mut self, b: u8) {
+        bytes::BufMut::put_u8(self, b);
+    }
+    #[inline]
+    fn extend_from_slice(&mut self, s: &[u8]) {
+        bytes::BytesMut::extend_from_slice(self, s);
+    }
+}
+
+impl<A: smallvec::Array<Item = u8>> ByteSink for smallvec::SmallVec<A> {
+    #[inline]
+    fn push(&mut self, b: u8) {
+        smallvec::SmallVec::push(self, b);
+    }
+    #[inline]
+    fn extend_from_slice(&mut self, s: &[u8]) {
+        smallvec::SmallVec::extend_from_slice(self, s);
+    }
+}
+
+/// Stack scratch big enough for any `d2string` / `ll2string` output. The
+/// longest possible result is `-1.7976931348623157e+308` at 24 bytes.
+pub type NumBuf = smallvec::SmallVec<[u8; 40]>;
+
 /// `util.c:d2string()` -- byte-exact.
 ///
 /// This is the function that decides what `ZSCORE`, `ZINCRBY`, `GEODIST` and
@@ -211,7 +264,7 @@ pub fn double2ll(v: f64) -> Option<i64> {
 /// Validated against a live Redis over 1033 doubles: every `f64` bit pattern
 /// class (subnormals, powers of two, `1e18` vs `1e19`, huge integers,
 /// `5e-324`) with zero mismatches.
-pub fn d2string(out: &mut Vec<u8>, v: f64) {
+pub fn d2string(out: &mut impl ByteSink, v: f64) {
     if v.is_nan() {
         out.extend_from_slice(b"nan");
         return;
@@ -315,7 +368,7 @@ fn decompose<'b>(shortest: &str, buf: &'b mut [u8; 24]) -> (&'b [u8], i32) {
 /// scientific layout exactly the way Redis does. The thresholds look arbitrary
 /// and are: they are what makes `1e20` print as `1e+20` while
 /// `1.2345678901234569e23` prints as `123456789012345690000000`.
-fn emit_digits(out: &mut Vec<u8>, shortest: &str, neg: bool) {
+fn emit_digits(out: &mut impl ByteSink, shortest: &str, neg: bool) {
     let mut scratch = [0u8; 24];
     let (digits, k) = decompose(shortest, &mut scratch);
     let nd = digits.len() as i32;
@@ -393,7 +446,7 @@ pub fn d2string_owned(v: f64) -> String {
 /// trailing zeros (and a trailing '.') stripped. Used by `INCRBYFLOAT`,
 /// `HINCRBYFLOAT` and `SORT BY ... GET #` replies, all of which are bulk
 /// strings a client will compare literally.
-pub fn ld2string_human(out: &mut Vec<u8>, v: f64) {
+pub fn ld2string_human(out: &mut impl ByteSink, v: f64) {
     if v.is_nan() {
         out.extend_from_slice(b"nan");
         return;

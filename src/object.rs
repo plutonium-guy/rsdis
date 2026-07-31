@@ -76,6 +76,33 @@ pub enum Robj {
     Stream(StreamObj),
 }
 
+/// §5.11: `Robj` has a hard size budget, enforced at compile time.
+///
+/// An enum is as wide as its widest variant, so a fat `StreamObj` or `ZSetObj`
+/// would inflate **every** entry in the keyspace -- including the millions of
+/// plain strings that never touch a stream -- and cost cache misses on every
+/// lookup. Redis keeps `robj` at 16 bytes for exactly this reason.
+///
+/// The budget is 40 bytes because that is the natural floor, not an arbitrary
+/// round number: `StrObj` is a `Bytes` (32 bytes) plus an 8-byte discriminant,
+/// and a string is the type the keyspace is mostly made of. Every other
+/// variant therefore has 40 bytes to work with for free.
+///
+/// If you are a W2 agent and your type does not fit -- `ZSetObj` (dict +
+/// skiplist) and `StreamObj` (rax + consumer groups) almost certainly will not
+/// -- box the payload (`Box<StreamData>`). That costs one indirection on a
+/// type that is already pointer-chasing internally, and saves 8-40 bytes on
+/// every string key in the server. **Do not raise this number.** Raising it is
+/// a keyspace-wide memory regression that will not show up in your own tests
+/// and will show up in W4's benchmark.
+const _: () = {
+    assert!(
+        core::mem::size_of::<Robj>() <= 40,
+        "Robj exceeded its 32-byte budget (§5.11): box the oversized variant's \
+         payload instead of raising this assertion"
+    );
+};
+
 impl Robj {
     /// What `TYPE` replies.
     #[inline]
@@ -318,5 +345,23 @@ mod tests {
         // 10000 minutes later everything has decayed away.
         lru::touch(&cell, 10_000 * 60_000, true, 10, 1);
         assert!(lru::lfu_counter(cell.load(Ordering::Relaxed)) <= 1);
+    }
+}
+
+#[cfg(test)]
+mod size_budget {
+    use super::*;
+
+    /// Companion to the `const` assertion above: this one reports the actual
+    /// numbers when it fails, which the compile-time check cannot do.
+    #[test]
+    fn robj_and_entry_stay_small() {
+        let robj = core::mem::size_of::<Robj>();
+        let entry = core::mem::size_of::<Entry>();
+        assert!(robj <= 40, "Robj grew to {robj} bytes (budget 40, §5.11)");
+        assert!(
+            entry <= 64,
+            "Entry grew to {entry} bytes (budget 64, §5.11)"
+        );
     }
 }

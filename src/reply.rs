@@ -204,15 +204,17 @@ impl<'a> ReplyWriter<'a> {
     /// as `1` and infinities as `inf` / `-inf`.
     pub fn double(&mut self, v: f64) {
         if self.is_resp3() {
+            // Straight into the connection buffer: no scratch, no allocation.
             self.buf.put_u8(b',');
-            self.put_double(v);
+            strnum::d2string(self.buf, v);
             self.buf.extend_from_slice(CRLF);
         } else {
             // RESP2 has no double type: Redis sends the same digits as a bulk.
-            let mut tmp = [0u8; 40];
-            let n = write_double(&mut tmp, v);
-            let slice = tmp.get(..n).unwrap_or(b"0");
-            self.bulk(slice);
+            // A bulk needs its length before its body, so the digits go to a
+            // stack scratch first -- still no allocation (§5.12).
+            let mut tmp = strnum::NumBuf::new();
+            strnum::d2string(&mut tmp, v);
+            self.bulk(&tmp);
         }
     }
 
@@ -356,39 +358,6 @@ impl<'a> ReplyWriter<'a> {
         let mut fmt = itoa::Buffer::new();
         self.buf.extend_from_slice(fmt.format(v).as_bytes());
     }
-
-    #[inline]
-    fn put_double(&mut self, v: f64) {
-        let mut tmp = [0u8; 40];
-        let n = write_double(&mut tmp, v);
-        if let Some(s) = tmp.get(..n) {
-            self.buf.extend_from_slice(s);
-        }
-    }
-}
-
-/// Format `v` into `buf` using Redis's `d2string` rules; returns the length.
-/// 40 bytes is always enough (`-1.7976931348623157e+308` is 24).
-fn write_double(buf: &mut [u8; 40], v: f64) -> usize {
-    // `d2string` appends to a Vec; use a stack scratch to keep this off the
-    // allocator. The scratch is a SmallVec-free hand roll so that the hot
-    // integer case never touches the heap.
-    if let Some(l) = strnum::double2ll(v) {
-        let mut fmt = itoa::Buffer::new();
-        let s = fmt.format(l).as_bytes();
-        let n = core::cmp::min(s.len(), buf.len());
-        if let (Some(d), Some(t)) = (buf.get_mut(..n), s.get(..n)) {
-            d.copy_from_slice(t);
-        }
-        return n;
-    }
-    let mut tmp = Vec::with_capacity(40);
-    strnum::d2string(&mut tmp, v);
-    let n = core::cmp::min(tmp.len(), buf.len());
-    if let (Some(d), Some(t)) = (buf.get_mut(..n), tmp.get(..n)) {
-        d.copy_from_slice(t);
-    }
-    n
 }
 
 /// Adapter so `core::fmt` can write into a `BytesMut` without an intermediate
@@ -493,7 +462,14 @@ mod tests {
         assert_eq!(render(RESP2, |w| w.double(1.0)), "$1\r\n1\r\n");
         assert_eq!(render(RESP3, |w| w.double(1.5)), ",1.5\r\n");
         assert_eq!(render(RESP2, |w| w.double(1.5)), "$3\r\n1.5\r\n");
-        assert_eq!(render(RESP3, |w| w.double(-0.0)), ",0\r\n");
+        // Negative zero keeps its sign: `util.c:d2string()` tests `value == 0`
+        // and branches on `1.0/value < 0` *before* it ever reaches the
+        // integer fast path, so Redis sends `-0`. An earlier version of this
+        // writer ran `double2ll` first, which folded -0.0 to the integer 0 and
+        // silently sent `0`; `strnum`'s own test already asserted `-0`.
+        assert_eq!(render(RESP3, |w| w.double(-0.0)), ",-0\r\n");
+        assert_eq!(render(RESP2, |w| w.double(-0.0)), "$2\r\n-0\r\n");
+        assert_eq!(render(RESP3, |w| w.double(0.0)), ",0\r\n");
         assert_eq!(render(RESP3, |w| w.double(f64::INFINITY)), ",inf\r\n");
         assert_eq!(render(RESP3, |w| w.double(f64::NEG_INFINITY)), ",-inf\r\n");
         assert_eq!(render(RESP3, |w| w.double(f64::NAN)), ",nan\r\n");
