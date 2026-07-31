@@ -2,13 +2,44 @@
 //!
 //! Owned by W1c; do not edit if you are not that agent.
 //!
-//! F0 defines [`NotifyClass`] in full, because `Ctx::notify` is a frozen
-//! signature that mentions it and every wave agent will call it from day one.
-//! The delivery half -- publishing `__keyspace@<db>__:<key>` and
-//! `__keyevent@<db>__:<event>` through pub/sub -- is W1c's, on top of W3b's
-//! pub/sub registry.
+//! F0 defined [`NotifyClass`] in full, because `Ctx::notify` is a frozen
+//! signature that mentions it and every wave agent calls it from day one. This
+//! module adds the delivery half: turning `(class, event, db, key)` into the
+//! two channels Redis publishes on,
+//!
+//! ```text
+//! K   __keyspace@<db>__:<key>     -> <event>
+//! E   __keyevent@<db>__:<event>   -> <key>
+//! ```
+//!
+//! # The pub/sub seam
+//!
+//! Fan-out belongs to W3b (`src/pubsub.rs`), which does not exist yet, and
+//! `ServerShared` is frozen so no field can be added for it. The seam is
+//! therefore a process-wide [`NotifySink`] that W3b installs once at startup
+//! with [`install_sink`]:
+//!
+//! ```ignore
+//! // W3b, during server construction:
+//! notify::install_sink(Arc::new(pubsub::KeyspaceNotifier));
+//! ```
+//!
+//! [`NotifySink::publish`] has exactly `PUBLISH`'s signature, so W3b's
+//! implementation is a one-liner over its own fan-out and this module never
+//! learns anything about the pub/sub registry. Until a sink is installed,
+//! `dispatch` builds nothing and costs two bit tests.
+//!
+//! Everything except the sink is testable today: [`CaptureSink`] records what
+//! would have been published.
+
+use std::sync::Arc;
 
 use bitflags::bitflags;
+use parking_lot::{Mutex, RwLock};
+use smallvec::SmallVec;
+
+use crate::ctx::ServerShared;
+use crate::object::Key;
 
 bitflags! {
     /// `notify-keyspace-events` classes, with Redis's exact character codes.
@@ -142,31 +173,170 @@ impl NotifyClass {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The pub/sub seam
+// ---------------------------------------------------------------------------
+
+/// Where a keyspace notification goes once this module has decided that it
+/// should be delivered and has built the channel name.
+///
+/// **Owner of the implementation: W3b.** The signature is deliberately
+/// `PUBLISH`'s, so the implementation is a call into the existing fan-out and
+/// nothing about the pub/sub registry leaks into this module.
+pub trait NotifySink: Send + Sync {
+    /// Publish `message` on `channel`, exactly as `PUBLISH` would, including
+    /// pattern subscribers. Returns the number of receivers (unused here, but
+    /// it keeps the signature identical to `PUBLISH` so an implementation can
+    /// simply forward).
+    fn publish(&self, server: &ServerShared, db: usize, channel: &[u8], message: &[u8]) -> usize;
+}
+
+/// Installed once at startup. An `RwLock` rather than a `OnceLock` so that
+/// tests can swap a capture sink in and out; reads only happen after the two
+/// cheap flag tests in [`dispatch`], never on a hot path.
+static SINK: RwLock<Option<Arc<dyn NotifySink>>> = RwLock::new(None);
+
+/// Serialises tests that install a sink, because the sink is process-wide.
+/// Production code never touches this.
+pub static SINK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Install the delivery sink, returning whatever was installed before.
+pub fn install_sink(sink: Arc<dyn NotifySink>) -> Option<Arc<dyn NotifySink>> {
+    SINK.write().replace(sink)
+}
+
+/// Remove the delivery sink. Notifications become no-ops again.
+pub fn clear_sink() -> Option<Arc<dyn NotifySink>> {
+    SINK.write().take()
+}
+
+/// The installed sink, if any.
+#[inline]
+pub fn sink() -> Option<Arc<dyn NotifySink>> {
+    SINK.read().clone()
+}
+
+/// Channel names are `__keyspace@<db>__:<key>`; 96 bytes inline covers every
+/// key short enough to matter without touching the allocator.
+type ChanBuf = SmallVec<[u8; 96]>;
+
+/// `__keyspace@<db>__:<key>`
+fn keyspace_channel(db: usize, key: &[u8]) -> ChanBuf {
+    let mut buf = ChanBuf::new();
+    buf.extend_from_slice(b"__keyspace@");
+    let mut fmt = itoa::Buffer::new();
+    buf.extend_from_slice(fmt.format(db).as_bytes());
+    buf.extend_from_slice(b"__:");
+    buf.extend_from_slice(key);
+    buf
+}
+
+/// `__keyevent@<db>__:<event>`
+fn keyevent_channel(db: usize, event: &str) -> ChanBuf {
+    let mut buf = ChanBuf::new();
+    buf.extend_from_slice(b"__keyevent@");
+    let mut fmt = itoa::Buffer::new();
+    buf.extend_from_slice(fmt.format(db).as_bytes());
+    buf.extend_from_slice(b"__:");
+    buf.extend_from_slice(event.as_bytes());
+    buf
+}
+
 /// Deliver a keyspace notification.
 ///
-/// F0 seeds the signature and the (already-gated) call site in `Ctx::notify`
-/// so that every wave agent can emit events from day one. W1c implements the
-/// body: publish `__keyspace@<db>__:<key>` -> `<event>` when `K` is set, and
-/// `__keyevent@<db>__:<event>` -> `<key>` when `E` is set, both through W3b's
-/// pub/sub fan-out.
+/// `Ctx::notify` (frozen) gates on `class.is_enabled_by(configured)` before
+/// calling this, but `Ctx::expire_if_needed` does not, so the gate is repeated
+/// here. It is two bit tests, and repeating it is what makes this function
+/// safe to call unconditionally from the background expiry and eviction
+/// cycles, which have no `Ctx`.
 ///
-/// The caller has already checked `class.is_enabled_by(configured)`, so this
-/// only runs when at least one subscriber class is armed.
-#[inline]
+/// Publishing happens on the caller's thread. Callers that hold a shard lock
+/// **must release it first**: `expire.rs` and `evict.rs` collect their victims
+/// under the lock and notify afterwards, so a slow subscriber can never stall
+/// a shard.
 pub fn dispatch(
-    _server: &crate::ctx::ServerShared,
-    _configured: NotifyClass,
-    _class: NotifyClass,
-    _event: &str,
-    _db: usize,
-    _key: &crate::object::Key,
+    server: &ServerShared,
+    configured: NotifyClass,
+    class: NotifyClass,
+    event: &str,
+    db: usize,
+    key: &Key,
 ) {
-    // Owner: W1c.
+    if !class.is_enabled_by(configured) {
+        return;
+    }
+    let Some(sink) = sink() else {
+        return;
+    };
+    if configured.contains(NotifyClass::KEYSPACE) {
+        let chan = keyspace_channel(db, key);
+        sink.publish(server, db, &chan, event.as_bytes());
+    }
+    if configured.contains(NotifyClass::KEYEVENT) {
+        let chan = keyevent_channel(db, event);
+        sink.publish(server, db, &chan, key);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test sink
+// ---------------------------------------------------------------------------
+
+/// A sink that records instead of publishing.
+///
+/// Not `#[cfg(test)]`: integration tests live in a separate crate and need it
+/// too. Take [`SINK_TEST_LOCK`] around any test that installs one.
+#[derive(Debug, Default)]
+pub struct CaptureSink {
+    events: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+}
+
+impl CaptureSink {
+    pub fn new() -> Self {
+        CaptureSink::default()
+    }
+
+    /// Every `(channel, message)` seen so far, clearing the log.
+    pub fn take(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        core::mem::take(&mut *self.events.lock())
+    }
+
+    /// Channels seen so far, as lossy UTF-8, clearing the log.
+    pub fn take_strings(&self) -> Vec<(String, String)> {
+        self.take()
+            .into_iter()
+            .map(|(c, m)| {
+                (
+                    String::from_utf8_lossy(&c).into_owned(),
+                    String::from_utf8_lossy(&m).into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl NotifySink for CaptureSink {
+    fn publish(&self, _server: &ServerShared, _db: usize, channel: &[u8], message: &[u8]) -> usize {
+        self.events
+            .lock()
+            .push((channel.to_vec(), message.to_vec()));
+        0
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use bytes::Bytes;
 
     #[test]
     fn parse_round_trip() {
@@ -191,5 +361,78 @@ mod tests {
         let cfg = NotifyClass::parse("Kgl").unwrap();
         assert!(NotifyClass::GENERIC.is_enabled_by(cfg));
         assert!(!NotifyClass::HASH.is_enabled_by(cfg));
+    }
+
+    #[test]
+    fn channel_names_match_redis() {
+        assert_eq!(&keyspace_channel(0, b"foo")[..], b"__keyspace@0__:foo");
+        assert_eq!(&keyspace_channel(15, b"a:b")[..], b"__keyspace@15__:a:b");
+        assert_eq!(
+            &keyevent_channel(9, "expired")[..],
+            b"__keyevent@9__:expired"
+        );
+    }
+
+    #[test]
+    fn dispatch_publishes_both_channels() {
+        let _guard = SINK_TEST_LOCK.lock();
+        let server = ServerShared::new(Config {
+            shard_count: 2,
+            ..Default::default()
+        });
+        let cap = Arc::new(CaptureSink::new());
+        install_sink(cap.clone());
+
+        let key = Bytes::from_static(b"mykey");
+        let all = NotifyClass::parse("KEA").unwrap();
+        dispatch(&server, all, NotifyClass::GENERIC, "del", 3, &key);
+        assert_eq!(
+            cap.take_strings(),
+            vec![
+                ("__keyspace@3__:mykey".to_string(), "del".to_string()),
+                ("__keyevent@3__:del".to_string(), "mykey".to_string()),
+            ]
+        );
+
+        // K only.
+        let k_only = NotifyClass::parse("Kg").unwrap();
+        dispatch(&server, k_only, NotifyClass::GENERIC, "del", 0, &key);
+        assert_eq!(
+            cap.take_strings(),
+            vec![("__keyspace@0__:mykey".to_string(), "del".to_string())]
+        );
+
+        // E only.
+        let e_only = NotifyClass::parse("Eg").unwrap();
+        dispatch(&server, e_only, NotifyClass::GENERIC, "del", 0, &key);
+        assert_eq!(
+            cap.take_strings(),
+            vec![("__keyevent@0__:del".to_string(), "mykey".to_string())]
+        );
+
+        // Class not armed: nothing at all.
+        dispatch(&server, e_only, NotifyClass::HASH, "hset", 0, &key);
+        assert!(cap.is_empty());
+
+        clear_sink();
+    }
+
+    #[test]
+    fn dispatch_without_a_sink_is_a_no_op() {
+        let _guard = SINK_TEST_LOCK.lock();
+        clear_sink();
+        let server = ServerShared::new(Config {
+            shard_count: 2,
+            ..Default::default()
+        });
+        // Must not panic and must not require anything to be installed.
+        dispatch(
+            &server,
+            NotifyClass::parse("KEA").unwrap(),
+            NotifyClass::GENERIC,
+            "del",
+            0,
+            &Bytes::from_static(b"k"),
+        );
     }
 }
