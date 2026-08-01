@@ -278,6 +278,51 @@ impl ServerShared {
             }
         })
     }
+
+    /// Spawn every background cycle the server needs: the coarse clock, the
+    /// per-shard active-expire tasks, and the eviction task.
+    ///
+    /// This exists as one call rather than three because forgetting one is
+    /// silent and expensive. Without the expire tasks, lazy expiry in
+    /// [`Ctx::lookup_read`] is the only reclamation path, so a key that
+    /// expires and is never touched again is never freed; without the evict
+    /// task, `maxmemory` is not enforced at all. Both failures look exactly
+    /// like a working server until memory runs out.
+    ///
+    /// **Any test harness that cares about expiry or eviction must call this**
+    /// rather than `spawn_clock_ticker` alone. The returned guard aborts every
+    /// task on drop, so a test does not leak cycles into its neighbours.
+    #[must_use = "dropping the guard immediately aborts every background task"]
+    pub fn spawn_cron(self: &Arc<Self>) -> CronTasks {
+        let mut tasks = vec![self.spawn_clock_ticker()];
+        tasks.extend(crate::shard::expire::spawn(self));
+        tasks.push(crate::shard::evict::spawn(self));
+        CronTasks { tasks }
+    }
+}
+
+/// Handle to the server's background tasks. Aborts them all when dropped.
+pub struct CronTasks {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl CronTasks {
+    /// Number of running background tasks (1 clock + one per shard + 1 evict).
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+}
+
+impl Drop for CronTasks {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

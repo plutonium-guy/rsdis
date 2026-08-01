@@ -60,8 +60,9 @@ fn main() -> ExitCode {
             "rsdis starting"
         );
 
-        // §5.6: the coarse clock.
-        let _ticker = server.spawn_clock_ticker();
+        // The coarse clock (§5.6), the per-shard active-expire cycles and the
+        // eviction cycle. Held until shutdown: dropping this aborts them.
+        let _cron = server.spawn_cron();
 
         let handle = match rsdis::net::serve(Arc::clone(&server)).await {
             Ok(h) => h,

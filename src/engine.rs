@@ -151,6 +151,24 @@ pub fn dispatch(
 
     // ---- lock --------------------------------------------------------------
     let cfg = server.config.snapshot();
+
+    // ---- maxmemory / DENYOOM ----------------------------------------------
+    // Checked here, before any lock is taken, because `check_oom` only reads
+    // atomics and because rejecting after acquiring shards would hold them for
+    // nothing. Only DENYOOM commands are gated: a read, a DEL or a CONFIG SET
+    // must still work when the server is full -- otherwise an over-limit
+    // instance with `noeviction` becomes unrecoverable.
+    //
+    // `check_oom` is not simply "used > maxmemory": being over the limit is
+    // fatal only when eviction cannot fix it (`noeviction`, or a `volatile-*`
+    // policy with no volatile keys left), mirroring `performEvictions`.
+    if spec.flags.contains(CmdFlags::DENYOOM)
+        && let Err(e) = crate::shard::evict::check_oom(server, &cfg)
+    {
+        reply_error(out, proto, &e, server);
+        return Outcome::Done;
+    }
+
     let now_ms = server.clock.now_ms();
     let set = shard_set_for(spec, args, &server.shards);
     let guards = server.shards.lock_set(&set);
