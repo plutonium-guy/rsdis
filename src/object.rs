@@ -98,7 +98,7 @@ pub enum Robj {
 const _: () = {
     assert!(
         core::mem::size_of::<Robj>() <= 40,
-        "Robj exceeded its 32-byte budget (§5.11): box the oversized variant's \
+        "Robj exceeded its 40-byte budget (§5.11): box the oversized variant's \
          payload instead of raising this assertion"
     );
 };

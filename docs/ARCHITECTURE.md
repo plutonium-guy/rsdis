@@ -540,14 +540,22 @@ zero-copy needs a vectored write queue of `Bytes` in `src/net` — **W1b owns th
 decision.** Until W1b does it, nobody may claim §5.1 is satisfied for large
 values.
 
-**9.12 Criterion cannot be used until a `[[bench]] harness = false` target
-exists.** `Cargo.toml` is F0's and agents cannot edit it, so a criterion bench
-in `benches/` is auto-discovered with the default test harness and its `main`
-never runs. Until this is fixed, write benchmarks as `#[ignore]`d self-timing
-tests and run them with
-`cargo test --release --bench <name> -- --ignored --nocapture`. **Report the
-filename in your handover** so the bench target can be registered at merge.
-W1b's `benches/protocol_bench.rs` is the reference for the interim style.
+**9.12 Benchmarks are `#[ignore]`d self-timing tests, not criterion.** All three
+W1 agents independently hit the same wall: `Cargo.toml` is F0's, agents cannot
+add a `[[bench]] harness = false` target, so a criterion `main` never runs and
+trips `clippy --all-targets -D warnings` as dead code. Rather than fight it,
+this is now the project convention. Write benchmarks as `#[ignore]`d tests that
+time themselves and print, and run them with:
+
+```
+cargo test --release --bench <name> -- --ignored --nocapture
+```
+
+`benches/encoding_bench.rs`, `benches/protocol_bench.rs` and
+`benches/keyspace_bench.rs` are the reference style. The `criterion`
+dev-dependency stays for W4, which will register proper targets when it does
+the comparative benchmarking against real Redis. **Name your bench file in your
+handover.**
 
 **9.11 Config quirks.** `port 0` is legal (means ephemeral) and `Config::validate`
 runs on every `CONFIG SET`, not just at startup. `Cli` is not a plain clap derive:
@@ -605,3 +613,8 @@ subcommand support in `CommandSpec`, so W1b set `client.last_command` by hand to
 get `cmd=client|list` and `'client|setname'` arity errors. Every container
 command (`CONFIG`, `XGROUP`, `OBJECT`, `MEMORY`) will repeat this. Worth a shared
 helper in W4, or real subcommand specs if `COMMAND DOCS` fidelity matters.
+
+**9.13 `list-compress-depth` is out of scope for v1.** W1a left the quicklist
+node-compression seam open and unimplemented. `src/util/lzf.rs` exists (RDB
+needs it) but quicklist does not call it. Revisit only if memory benchmarks
+justify it.
